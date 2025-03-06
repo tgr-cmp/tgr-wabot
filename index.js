@@ -1,19 +1,17 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
-const pino = require('pino')
+const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
-const readline = require("node:readline")
+const handleCase = require('./case');
+
 // Nonaktifkan pemeriksaan update ytdl-core
 process.env.YTDL_NO_UPDATE = '1';
 
 // Command Handler Setup
 const commands = new Map();
 const commandsDir = path.join(__dirname, 'commands');
-
-//alok
-const question = (text) => { const rl = readline.createInterface({ input: process.stdin, output: process.stdout }); return new Promise((resolve) => { rl.question(text, resolve) }) };
 
 // Database JSON Setup
 const dbPath = path.join(__dirname, 'database/db.json');
@@ -23,9 +21,10 @@ if (!fs.existsSync(path.join(__dirname, 'database'))) {
 if (!fs.existsSync(dbPath)) {
     fs.writeFileSync(dbPath, JSON.stringify({ 
         users: {}, 
-        groups: {}, // Tambahan untuk grup
+        groups: {},
         commands: {},
-        captchas: {}
+        captchas: {},
+        reports: {} // Tambahan untuk menyimpan laporan
     }, null, 2));
 }
 
@@ -41,7 +40,12 @@ const generateCaptcha = () => {
     return { question: `${num1} + ${num2} = ?`, answer };
 };
 
-// Load commands
+// Fungsi untuk memeriksa apakah sender adalah owner
+const isOwner = (sender) => {
+    return sender.startsWith(config.ownerNumber);
+};
+
+// Load commands dari folder commands/
 function loadCommands() {
     const files = fs.readdirSync(commandsDir).filter(file => file.endsWith('.js'));
     for (const file of files) {
@@ -51,27 +55,20 @@ function loadCommands() {
     }
 }
 
-// Eksport commands dan db ke global
+// Eksport commands, db, dan isOwner ke global
 global.commands = commands;
 global.db = { read: readDB, write: writeDB, generateCaptcha };
+global.isOwner = isOwner;
 
 async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('sessions');
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     
     const sock = makeWASocket({
-        logger: pino({ level: "silent" }),
         printQRInTerminal: true,
         auth: state,
         defaultQueryTimeoutMs: undefined
     });
 
-    if (!sock.authState.creds.registered) {
-        const phoneNumber = await question('Enter Phone Number :\n');
-        let code = await sock.requestPairingCode(phoneNumber);
-        code = code?.match(/.{1,4}/g)?.join("-") || code;
-        console.log(`Pairing Code :`, code);
-        }
-        
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
@@ -122,46 +119,58 @@ async function connectToWhatsApp() {
         const args = commandBody.split(/ +/);
         const commandName = args.shift().toLowerCase();
 
+        // Inisialisasi data pengguna jika belum ada
+        const dbData = global.db.read();
+        if (!dbData.users[sender]) {
+            dbData.users[sender] = {
+                verify: false,
+                limit: 10,
+                money: 1000,
+                commandCount: 0,
+                lastUsed: null,
+                downloads: { ytmp3: 0, ytmp4: 0 }
+            };
+        }
+        // Inisialisasi data grup jika belum ada (opsional)
+        if (!dbData.groups[from] && from.endsWith('@g.us')) {
+            dbData.groups[from] = {
+                commandCount: 0,
+                lastUsed: null
+            };
+        }
+
+        // Log penggunaan command untuk pengguna
+        dbData.users[sender].commandCount += 1;
+        dbData.users[sender].lastUsed = new Date().toISOString();
+        if (from.endsWith('@g.us')) {
+            dbData.groups[from].commandCount += 1;
+            dbData.groups[from].lastUsed = new Date().toISOString();
+        }
+        if (!dbData.commands[commandName]) {
+            dbData.commands[commandName] = { usage: 0 };
+        }
+        dbData.commands[commandName].usage += 1;
+        global.db.write(dbData);
+
+        // Cek command di folder commands/
         const command = commands.get(commandName);
         if (command) {
             try {
-                // Inisialisasi data pengguna jika belum ada
-                const dbData = global.db.read();
-                if (!dbData.users[sender]) {
-                    dbData.users[sender] = {
-                        verify: false,
-                        limit: 10,
-                        money: 1000,
-                        commandCount: 0,
-                        lastUsed: null,
-                        downloads: { ytmp3: 0, ytmp4: 0 }
-                    };
-                }
-                // Inisialisasi data grup jika belum ada (opsional)
-                if (!dbData.groups[from] && from.endsWith('@g.us')) {
-                    dbData.groups[from] = {
-                        commandCount: 0,
-                        lastUsed: null
-                    };
-                }
-
-                // Log penggunaan command untuk pengguna
-                dbData.users[sender].commandCount += 1;
-                dbData.users[sender].lastUsed = new Date().toISOString();
-                if (from.endsWith('@g.us')) {
-                    dbData.groups[from].commandCount += 1;
-                    dbData.groups[from].lastUsed = new Date().toISOString();
-                }
-                if (!dbData.commands[commandName]) {
-                    dbData.commands[commandName] = { usage: 0 };
-                }
-                dbData.commands[commandName].usage += 1;
-                global.db.write(dbData);
-
                 await command.execute(sock, from, args, usedPrefix, sender);
             } catch (error) {
                 console.error(`Error executing ${commandName}:`, error);
                 await sock.sendMessage(from, { text: 'Terjadi kesalahan saat menjalankan perintah!' });
+            }
+        } else {
+            // Jika tidak ditemukan di folder commands/, cek di case.js
+            try {
+                const handled = await handleCase(commandName, sock, from, args, usedPrefix, sender, msg);
+                if (!handled) {
+                    await sock.sendMessage(from, { text: `Perintah ${usedPrefix}${commandName} tidak ditemukan!` });
+                }
+            } catch (error) {
+                console.error(`Error in case handler for ${commandName}:`, error);
+                await sock.sendMessage(from, { text: 'Terjadi kesalahan saat menjalankan perintah case!' });
             }
         }
     });
